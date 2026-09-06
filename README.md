@@ -1,6 +1,6 @@
-# DownloadHelper
+# Hana Download Helper
 
-仿 Internet Download Manager 的 Python 下载器：多线程分块下载 + BT/磁力下载 + 断点续传，配备现代化暗色 PySide6 界面。
+仿 Internet Download Manager 的 Python 下载器：多线程分块下载 + BT/磁力下载 + 断点续传，配备现代化深色/浅色可切换的 PySide6 界面。
 
 ## 功能特性
 

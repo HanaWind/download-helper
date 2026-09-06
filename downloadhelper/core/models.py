@@ -84,7 +84,7 @@ class FileInfo:
         )
 
 
-DEFAULT_SAVE_DIR = os.path.join(os.path.expanduser("~"), "Downloads", "DownloadHelper")
+DEFAULT_SAVE_DIR = os.path.join(os.path.expanduser("~"), "Downloads", "Hana Download Helper")
 APP_DIR = os.path.join(os.path.expanduser("~"), ".downloadhelper")
 
 
@@ -105,12 +105,19 @@ def tasks_path() -> str:
     return os.path.join(APP_DIR, "tasks.json")
 
 
+THEME_MODES = ("dark", "light", "auto")
+
+
 @dataclass
 class Config:
     save_dir: str = DEFAULT_SAVE_DIR
     threads: int = 8          # 单文件分块线程数
     max_active: int = 3       # 同时下载的文件数（需求：最多 3 个）
     max_retry: int = 5
+    theme_mode: str = "dark"  # dark / light / auto（跟随时间）
+    bg_image: str = ""        # 自定义背景图路径，空表示不使用
+    bg_opacity: int = 55      # 背景图不透明度 0~100
+    bg_blur: int = 0          # 背景图高斯模糊半径（像素），0 表示不模糊
 
     def clamp(self) -> "Config":
         self.threads = max(1, min(16, int(self.threads)))
@@ -118,6 +125,13 @@ class Config:
         self.max_retry = max(0, min(10, int(self.max_retry)))
         if not self.save_dir:
             self.save_dir = DEFAULT_SAVE_DIR
+        if self.theme_mode not in THEME_MODES:
+            self.theme_mode = "dark"
+        self.bg_image = str(self.bg_image or "")
+        if self.bg_image and not os.path.isfile(self.bg_image):
+            self.bg_image = ""
+        self.bg_opacity = max(0, min(100, int(self.bg_opacity)))
+        self.bg_blur = max(0, min(40, int(self.bg_blur)))
         return self
 
     def to_dict(self) -> Dict[str, Any]:
@@ -126,6 +140,10 @@ class Config:
             "threads": self.threads,
             "max_active": self.max_active,
             "max_retry": self.max_retry,
+            "theme_mode": self.theme_mode,
+            "bg_image": self.bg_image,
+            "bg_opacity": self.bg_opacity,
+            "bg_blur": self.bg_blur,
         }
 
     @classmethod
@@ -140,6 +158,10 @@ class Config:
             threads=int(data.get("threads", 8)),
             max_active=int(data.get("max_active", 3)),
             max_retry=int(data.get("max_retry", 5)),
+            theme_mode=str(data.get("theme_mode", "dark")),
+            bg_image=str(data.get("bg_image", "")),
+            bg_opacity=int(data.get("bg_opacity", 55)),
+            bg_blur=int(data.get("bg_blur", 0)),
         )
         return cfg.clamp()
 

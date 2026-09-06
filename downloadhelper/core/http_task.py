@@ -269,6 +269,11 @@ class HttpDownloadTask(BaseTask):
                     self.emit_updated(force=True)
                     if self._sleep(min(2 * attempt, 10)):
                         return
+                else:
+                    # 本次请求成功下载，清除临时性的“连接异常”提示
+                    if self.state is TaskState.DOWNLOADING and self.message.startswith("连接异常"):
+                        self.message = self._progress_message()
+                        self.emit_updated(force=True)
         finally:
             session.close()
 

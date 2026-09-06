@@ -1,4 +1,4 @@
-# DownloadHelper 依赖
+# Hana Download Helper 依赖
 # 注意：libtorrent（BT/磁力）官方 wheel 目前最高支持 Python 3.13，
 # Python 3.14 无法安装，请使用 3.9 ~ 3.13 的解释器运行本程序。
 PySide6>=6.6,<7

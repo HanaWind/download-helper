@@ -9,7 +9,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QMessageBox,
     QPushButton,
     QScrollArea,
     QToolButton,
@@ -22,11 +21,12 @@ from ..core.models import Config, FileInfo, TaskState
 from ..core.probe import MagnetProbe, UrlProbe
 from ..core.utils import detect_kind, format_speed
 from .base import FramelessWindow, TitleBar, add_size_grip
+from .confirm_dialog import ConfirmDialog
 from .icons import app_icon, get_icon
 from .info_dialog import FileInfoDialog
 from .settings_dialog import SettingsDialog
 from .task_card import TaskCard, reveal_file
-from .theme import COLORS, QSS
+from .theme import COLORS, QSS, get_theme
 
 
 class MainWindow(FramelessWindow):
@@ -38,7 +38,7 @@ class MainWindow(FramelessWindow):
         self._cards: dict = {}
         self._probe = None
 
-        self.setWindowTitle("DownloadHelper")
+        self.setWindowTitle("Hana Download Helper")
         self.setWindowIcon(app_icon(64))
         self.resize(1040, 700)
         self.setMinimumSize(920, 580)
@@ -55,7 +55,7 @@ class MainWindow(FramelessWindow):
 
     # ------------------------------------------------------------------ 构建界面
     def _build_ui(self):
-        self.title_bar = TitleBar(self, "DownloadHelper", "多线程 · 断点续传 · BT 磁力下载器")
+        self.title_bar = TitleBar(self, "Hana Download Helper")
         self.content_layout.addWidget(self.title_bar)
 
         body = QWidget()
@@ -316,14 +316,14 @@ class MainWindow(FramelessWindow):
     def _remove_task(self, task):
         finished = task.state is TaskState.FINISHED
         if not finished:
-            answer = QMessageBox.question(
+            ok = ConfirmDialog.ask(
                 self,
                 "删除任务",
                 "删除任务会清除已下载的分片文件，确定继续吗？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
+                confirm_text="删除",
+                danger=True,
             )
-            if answer != QMessageBox.StandardButton.Yes:
+            if not ok:
                 return
         self.manager.remove_task(task.id, delete_files=not finished)
 
@@ -382,11 +382,21 @@ def run() -> int:
     import sys
 
     app = QApplication.instance() or QApplication(sys.argv)
-    app.setApplicationName("DownloadHelper")
-    app.setApplicationDisplayName("DownloadHelper")
+    app.setApplicationName("Hana Download Helper")
+    app.setApplicationDisplayName("Hana Download Helper")
     app.setWindowIcon(app_icon(64))
     app.setAttribute(Qt.ApplicationAttribute.AA_DontCreateNativeWidgetSiblings, True)
     app.setStyleSheet(QSS)
+
+    # 按已保存的配置应用主题（模式 / 背景图 / 不透明度 / 模糊度）
+    cfg = Config.load()
+    get_theme().configure(
+        mode=cfg.theme_mode,
+        image=cfg.bg_image,
+        opacity=cfg.bg_opacity,
+        blur=cfg.bg_blur,
+    )
+    get_theme().apply(app)
 
     window = MainWindow()
     window.show()

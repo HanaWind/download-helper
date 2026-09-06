@@ -1,4 +1,4 @@
-"""DownloadHelper 启动入口。"""
+"""Hana Download Helper 启动入口。"""
 
 import os
 import sys

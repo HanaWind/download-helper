@@ -21,7 +21,7 @@ from .utils import (
 DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36 DownloadHelper/1.0"
+        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36 HanaDownloadHelper/1.0"
     ),
     "Accept": "*/*",
     "Accept-Encoding": "identity",

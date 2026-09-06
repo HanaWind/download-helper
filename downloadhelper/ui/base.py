@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QSize, Qt
-from PySide6.QtGui import QColor, QMouseEvent
+from PySide6.QtCore import QEvent, QRect, QSize, Qt, QPropertyAnimation, QEasingCurve
+from PySide6.QtGui import (
+    QColor,
+    QMouseEvent,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QBrush,
+)
 from PySide6.QtWidgets import (
     QDialog,
     QFrame,
+    QGraphicsBlurEffect,
     QGraphicsDropShadowEffect,
+    QGraphicsPixmapItem,
+    QGraphicsScene,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -18,9 +29,29 @@ from PySide6.QtWidgets import (
 )
 
 from .icons import get_icon
-from .theme import COLORS
+from .theme import COLORS, get_theme
 
 SHADOW_MARGIN = 10
+WINDOW_RADIUS = 14
+
+
+def _blur_pixmap(pixmap: QPixmap, radius: int) -> QPixmap:
+    """对 QPixmap 做高斯模糊（利用 QGraphicsBlurEffect 离屏渲染）。"""
+    if radius <= 0 or pixmap.isNull():
+        return pixmap
+    scene = QGraphicsScene()
+    item = QGraphicsPixmapItem(pixmap)
+    effect = QGraphicsBlurEffect()
+    effect.setBlurRadius(radius)
+    item.setGraphicsEffect(effect)
+    scene.addItem(item)
+    result = QPixmap(pixmap.width(), pixmap.height())
+    result.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(result)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    scene.render(painter)
+    painter.end()
+    return result
 
 
 class TitleBarButton(QToolButton):
@@ -52,6 +83,12 @@ class TitleBarButton(QToolButton):
         self._icon_name = name
         self.setIcon(get_icon(name, self._color, 16))
 
+    def refresh_theme(self, muted: str = None, text: str = None):
+        """主题切换后按新配色重绘图标。"""
+        self._color = muted or COLORS["muted"]
+        self._hover_color = text or COLORS["text"]
+        self.setIcon(get_icon(self._icon_name, self._color, 16))
+
 
 class TitleBar(QFrame):
     """可拖动、可双击最大化的标题栏。"""
@@ -62,6 +99,7 @@ class TitleBar(QFrame):
         self.setObjectName("TitleBar")
         self.setFixedHeight(52)
         self._window = parent
+        self._icon_name = icon_name
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(16, 0, 8, 0)
@@ -100,6 +138,16 @@ class TitleBar(QFrame):
         else:
             window.showMaximized()
 
+    def refresh_icons(self):
+        """主题切换后刷新标题栏图标配色。"""
+        for button in self.findChildren(TitleBarButton):
+            button.refresh_theme()
+        icon_label = self.findChild(QLabel)
+        if icon_label is not None:
+            icon_label.setPixmap(
+                get_icon(self._icon_name, COLORS["accent"], 20).pixmap(20, 20)
+            )
+
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:
             handle = self._window.windowHandle()
@@ -114,16 +162,86 @@ class TitleBar(QFrame):
         super().mouseDoubleClickEvent(event)
 
 
+class Backdrop(QWidget):
+    """窗口底板：绘制主题背景色，或按比例铺满的自定义背景图（支持高斯模糊）。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._pixmap = QPixmap()
+        self._image = ""
+        self._alpha = 0.55
+        self._blur = 0
+
+    def refresh_theme(self):
+        theme = get_theme()
+        self._image = theme.background_image
+        self._alpha = theme.background_alpha
+        self._blur = theme.background_blur
+        if theme.has_background:
+            pix = QPixmap(self._image)
+            if self._blur > 0:
+                pix = _blur_pixmap(pix, self._blur)
+            self._pixmap = pix
+        else:
+            self._pixmap = QPixmap()
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+
+        rect = self.rect()
+        radius = WINDOW_RADIUS
+        path = QPainterPath()
+        path.addRoundedRect(rect.x(), rect.y(), rect.width(), rect.height(), radius, radius)
+        # 裁剪到圆角矩形，使窗口四角真正圆角
+        painter.setClipPath(path)
+
+        base = QColor(COLORS.get("bg", "#0F1420"))
+        painter.fillRect(rect, base)
+
+        if not self._pixmap.isNull():
+            # 额外留出模糊半径的余量，避免边缘出现透明边
+            pad = self._blur
+            target = QSize(rect.width() + 2 * pad, rect.height() + 2 * pad)
+            scaled = self._pixmap.scaled(
+                target,
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            x = int((rect.width() - scaled.width()) / 2)
+            y = int((rect.height() - scaled.height()) / 2)
+            painter.setOpacity(self._alpha)
+            painter.drawPixmap(x, y, scaled)
+            painter.setOpacity(1.0)
+            # 叠加一层底色，保证文字与控件的可读性
+            overlay = QColor(base)
+            overlay.setAlphaF(0.15 + 0.5 * (1.0 - self._alpha))
+            painter.fillRect(rect, overlay)
+
+        # 圆角描边，强化边缘
+        border = QColor(COLORS.get("border", "#2A3350"))
+        pen = QPen(border)
+        pen.setWidth(1)
+        painter.setPen(pen)
+        painter.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        painter.drawPath(path)
+        painter.end()
+
+
 class _FramelessMixin:
     """提供圆角阴影容器与最大化时的边距自适应。"""
 
     def _init_container(self):
         outer = QWidget()
+        outer.setObjectName("ShadowOuter")
         outer_layout = QVBoxLayout(outer)
         outer_layout.setContentsMargins(SHADOW_MARGIN, SHADOW_MARGIN, SHADOW_MARGIN, SHADOW_MARGIN)
         outer_layout.setSpacing(0)
 
-        container = QWidget()
+        container = Backdrop()
         container.setObjectName("AppContainer")
         shadow = QGraphicsDropShadowEffect(container)
         shadow.setBlurRadius(26)
@@ -131,6 +249,7 @@ class _FramelessMixin:
         shadow.setColor(QColor(0, 0, 0, 170))
         container.setGraphicsEffect(shadow)
         outer_layout.addWidget(container)
+        get_theme().register(container)
 
         content_layout = QVBoxLayout(container)
         content_layout.setContentsMargins(0, 0, 0, 0)
@@ -169,9 +288,78 @@ class FramelessDialog(QDialog, _FramelessMixin):
             Qt.WindowType.FramelessWindowHint | Qt.WindowType.Dialog
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._closing = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._init_container())
+
+    # ------------------------------------------------------------------ 动画
+    def _scaled_geometry(self, geo: QRect, factor: float) -> QRect:
+        w = int(geo.width() * factor)
+        h = int(geo.height() * factor)
+        return QRect(
+            geo.x() + (geo.width() - w) // 2,
+            geo.y() + (geo.height() - h) // 2,
+            w,
+            h,
+        )
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._animate_in()
+
+    def _animate_in(self):
+        geo = self.geometry()
+        if not geo.isValid() or geo.width() <= 0:
+            return
+        start = self._scaled_geometry(geo, 0.94)
+        self.setGeometry(start)
+        self.setWindowOpacity(0.0)
+        self._anim_geo = QPropertyAnimation(self, b"geometry")
+        self._anim_geo.setDuration(170)
+        self._anim_geo.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim_geo.setStartValue(start)
+        self._anim_geo.setEndValue(geo)
+        self._anim_opa = QPropertyAnimation(self, b"windowOpacity")
+        self._anim_opa.setDuration(170)
+        self._anim_opa.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim_opa.setStartValue(0.0)
+        self._anim_opa.setEndValue(1.0)
+        self._anim_geo.start()
+        self._anim_opa.start()
+
+    def _start_close(self, result):
+        if self._closing:
+            return
+        self._closing = True
+        geo = self.geometry()
+        end = self._scaled_geometry(geo, 0.94)
+        self._anim_geo = QPropertyAnimation(self, b"geometry")
+        self._anim_geo.setDuration(140)
+        self._anim_geo.setEasingCurve(QEasingCurve.Type.InCubic)
+        self._anim_geo.setStartValue(geo)
+        self._anim_geo.setEndValue(end)
+        self._anim_opa = QPropertyAnimation(self, b"windowOpacity")
+        self._anim_opa.setDuration(140)
+        self._anim_opa.setEasingCurve(QEasingCurve.Type.InCubic)
+        self._anim_opa.setStartValue(1.0)
+        self._anim_opa.setEndValue(0.0)
+        self._anim_opa.finished.connect(lambda: self.done(result))
+        self._anim_geo.start()
+        self._anim_opa.start()
+
+    def accept(self):
+        self._start_close(QDialog.DialogCode.Accepted)
+
+    def reject(self):
+        self._start_close(QDialog.DialogCode.Rejected)
+
+    def closeEvent(self, event):
+        if self._closing:
+            event.accept()
+            return
+        event.ignore()
+        self.reject()
 
 
 def add_size_grip(layout):
