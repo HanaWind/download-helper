@@ -10,12 +10,17 @@ import logging
 import os
 import random
 import string
+import sys
 from datetime import datetime
 from typing import Optional
 
-# 程序根目录（含 main.py）：
-#   downloadhelper/core/logging_setup.py -> downloadhelper/core -> downloadhelper -> 根
-_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# 程序根目录：
+#   - 开发态：downloadhelper/core/logging_setup.py -> downloadhelper/core -> downloadhelper -> 根
+#   - 打包态（PyInstaller）：日志应落在 exe 同级目录，便于用户查看
+if getattr(sys, "frozen", False):
+    _ROOT = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 LOG_DIR = os.path.join(_ROOT, "logs")
 
 _LOGGER_NAME = "HanaDownloadHelper"

@@ -3,5 +3,8 @@ __pycache__/
 *.py[cod]
 tests/*.log
 tests/*.err
+tests/preview_*.png
 .DS_Store
 logs/
+build/
+dist/
