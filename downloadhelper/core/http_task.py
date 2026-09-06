@@ -14,7 +14,10 @@ import requests
 from .base_task import BaseTask
 from .models import TaskState
 from .probe import DEFAULT_HEADERS
+from .logging_setup import get_logger
 from .utils import sanitize_filename, unique_path
+
+logger = get_logger()
 
 BLOCK_SIZE = 64 * 1024
 MIN_CHUNK_SIZE = 512 * 1024
@@ -182,6 +185,7 @@ class HttpDownloadTask(BaseTask):
         self._stop_event.clear()
         self._run_event.set()
         self.set_state(TaskState.DOWNLOADING, self._progress_message())
+        logger.info("HTTP 任务启动：%s（%d 线程，大小 %s）", self.info.name, len(self.chunks), self.total)
         self._ensure_workers()
         # 分片可能在上一次运行中已全部完成（续传场景）
         self._check_complete()
@@ -263,6 +267,7 @@ class HttpDownloadTask(BaseTask):
                         return
                     attempt += 1
                     if attempt > self.max_retry:
+                        logger.error("HTTP 任务下载失败：%s 原因=%s", self.info.name, exc)
                         self.fail(f"下载失败（重试 {self.max_retry} 次仍失败）：{exc}")
                         return
                     self.message = f"连接异常，{attempt}/{self.max_retry} 次重试：{exc}"
@@ -369,6 +374,7 @@ class HttpDownloadTask(BaseTask):
         except OSError:
             pass
         self.set_state(TaskState.FINISHED, "下载完成")
+        logger.info("HTTP 任务完成：%s", self.info.name)
         self.emit_updated(force=True)
         self.finished.emit(self)
 

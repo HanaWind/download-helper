@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 import warnings
 
 from PySide6.QtCore import QTimer
 
 from .base_task import BaseTask
 from .models import TaskState
+from .logging_setup import get_logger
+
+logger = get_logger()
 
 _LISTEN_PORT = 6881
 _session = None
@@ -100,6 +104,8 @@ class TorrentDownloadTask(BaseTask):
         self._timer.setInterval(self.POLL_INTERVAL)
         self._timer.timeout.connect(self._poll)
         self._finish_emitted = False
+        self._start_ts = time.time()
+        self.metadata_timeout = 180  # 磁力链接获取种子信息的最长等待（秒）
 
     # ------------------------------------------------------------------ 启动
     def start(self):
@@ -120,10 +126,13 @@ class TorrentDownloadTask(BaseTask):
                 self.fail("无法解析该 BT 链接")
                 return
             params.save_path = self.save_dir
+            # 注意：不能设置 upload_mode（该模式只取元数据、不下载文件数据），
+            # 否则磁力链接即使拿到种子信息也永远无法真正下载。
             params.flags = (
-                (params.flags | lt.torrent_flags.upload_mode)
+                params.flags
                 & ~lt.torrent_flags.auto_managed
                 & ~lt.torrent_flags.paused
+                & ~lt.torrent_flags.upload_mode
             )
             self._handle = session.add_torrent(params)
 
@@ -133,6 +142,7 @@ class TorrentDownloadTask(BaseTask):
             TaskState.PREPARING if self.total <= 0 else TaskState.DOWNLOADING,
             "正在连接节点…" if self.total <= 0 else "正在下载",
         )
+        logger.info("BT/磁力任务启动：%s（%s）", self.info.name, self.info.url[:60])
         self._timer.start()
 
     def _build_params(self, lt):
@@ -184,6 +194,12 @@ class TorrentDownloadTask(BaseTask):
             pass
 
         if not status.has_metadata:
+            # 磁力链接长时间拿不到种子信息：超时后报错，避免界面一直卡在“获取种子信息”
+            if self.total < 0 and time.time() - self._start_ts > self.metadata_timeout:
+                logger.warning("磁力链接获取种子信息超时：%s", self.info.url[:60])
+                self.fail("获取种子信息超时，请确认磁力链接有效或网络可访问 DHT")
+                self._timer.stop()
+                return
             self.set_state(TaskState.PREPARING, "正在获取种子信息…")
             self.emit_updated()
             return
@@ -217,6 +233,7 @@ class TorrentDownloadTask(BaseTask):
         if self.total > 0:
             self.received = self.total
         self.set_state(TaskState.FINISHED, "下载完成")
+        logger.info("BT/磁力任务完成：%s", self.info.name)
         self.emit_updated(force=True)
         self.finished.emit(self)
 

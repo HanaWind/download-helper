@@ -8,6 +8,7 @@ import warnings
 
 from PySide6.QtCore import QThread, Signal
 
+from .logging_setup import get_logger
 from .models import APP_DIR, FileInfo, LinkKind, ensure_app_dir
 from .utils import (
     detect_kind,
@@ -28,6 +29,8 @@ DEFAULT_HEADERS = {
 }
 CONNECT_TIMEOUT = 8
 READ_TIMEOUT = 20
+
+logger = get_logger()
 
 
 class ProbeError(Exception):
@@ -202,10 +205,13 @@ class UrlProbe(QThread):
         try:
             info = probe_url(self.url)
         except ProbeError as exc:
+            logger.warning("链接解析失败：%s 原因=%s", self.url[:80], exc)
             self.error.emit(str(exc))
         except Exception as exc:  # 兜底，保证界面不会崩
+            logger.exception("链接解析异常：%s", self.url[:80])
             self.error.emit(f"解析链接失败：{exc}")
         else:
+            logger.info("链接解析成功：%s 名称=%s 大小=%s", self.url[:80], info.name, info.size)
             self.result.emit(info)
 
 
@@ -243,6 +249,7 @@ class MagnetProbe(QThread):
                 warnings.simplefilter("ignore")
                 params = lt.parse_magnet_uri(self.magnet)
         except Exception as exc:
+            logger.warning("磁力链接格式错误：%s 原因=%s", self.magnet[:80], exc)
             self.error.emit(f"磁力链接格式错误：{exc}")
             return
 
@@ -260,6 +267,7 @@ class MagnetProbe(QThread):
             )
             self._handle = session.add_torrent(params)
         except Exception as exc:
+            logger.error("磁力链接创建 BT 会话失败：%s 原因=%s", self.magnet[:80], exc)
             self.error.emit(f"无法创建 BT 任务：{exc}")
             return
 
@@ -302,6 +310,7 @@ class MagnetProbe(QThread):
                         )
                         return
             except Exception as exc:
+                logger.error("磁力链接读取种子信息异常：%s 原因=%s", self.magnet[:80], exc)
                 self.error.emit(f"读取种子信息失败：{exc}")
                 return
             self.msleep(400)
@@ -310,4 +319,5 @@ class MagnetProbe(QThread):
             session.remove_torrent(self._handle)
         except Exception:
             pass
+        logger.warning("磁力链接获取种子信息超时：%s", self.magnet[:80])
         self.error.emit("获取种子信息超时，请检查网络或磁力链接是否有效")

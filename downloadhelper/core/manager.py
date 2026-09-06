@@ -9,9 +9,12 @@ from PySide6.QtCore import QObject, QTimer, Signal
 
 from .base_task import BaseTask
 from .http_task import HttpDownloadTask
+from .logging_setup import get_logger
 from .models import Config, FileInfo, LinkKind, TaskState, tasks_path
 from .torrent_task import TorrentDownloadTask
 from .utils import sanitize_filename
+
+logger = get_logger()
 
 MAX_CONCURRENT = 3
 
@@ -48,6 +51,7 @@ class DownloadManager(QObject):
         task.finished.connect(lambda t=task: self._on_task_finished(t))
         self.tasks.append(task)
         self._index[task.id] = task
+        logger.info("添加任务：%s（类型=%s，保存至 %s）", info.name, info.kind.value, save_dir)
         self.taskAdded.emit(task)
         self._schedule_save()
         self.pump()
@@ -57,6 +61,7 @@ class DownloadManager(QObject):
         task = self._index.pop(task_id, None)
         if task is None:
             return None
+        logger.info("移除任务：%s（删除文件=%s）", task.info.name, delete_files)
         try:
             task.cancel(remove_files=delete_files)
         except Exception:
@@ -133,6 +138,7 @@ class DownloadManager(QObject):
         self._schedule_save()
 
     def _on_task_finished(self, task: BaseTask):
+        logger.info("任务结束：%s 状态=%s", task.info.name, task.state.name)
         self.taskFinished.emit(task)
         self._schedule_save()
         self.pump()

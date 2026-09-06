@@ -4,3 +4,4 @@ __pycache__/
 tests/*.log
 tests/*.err
 .DS_Store
+logs/

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+import sys
+
 from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtWidgets import (
     QApplication,
@@ -11,11 +14,13 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QScrollArea,
+    QStackedWidget,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
+from ..core.logging_setup import get_logger, setup_logging
 from ..core.manager import DownloadManager
 from ..core.models import Config, FileInfo, TaskState
 from ..core.probe import MagnetProbe, UrlProbe
@@ -27,6 +32,8 @@ from .info_dialog import FileInfoDialog
 from .settings_dialog import SettingsDialog
 from .task_card import TaskCard, reveal_file
 from .theme import COLORS, QSS, get_theme
+
+logger = get_logger()
 
 
 class MainWindow(FramelessWindow):
@@ -153,9 +160,14 @@ class MainWindow(FramelessWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
+        # 任务列表页与空状态页用栈式布局切换：
+        # 空状态页会让提示信息在主区域正中央显示，而非被挤到下半部分。
+        self.stack = QStackedWidget()
+
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll.setObjectName("TaskScroll")
 
         self.list_container = QWidget()
         self.list_layout = QVBoxLayout(self.list_container)
@@ -163,10 +175,12 @@ class MainWindow(FramelessWindow):
         self.list_layout.setSpacing(10)
         self.list_layout.addStretch(1)
         self.scroll.setWidget(self.list_container)
-        layout.addWidget(self.scroll, 1)
+        self.stack.addWidget(self.scroll)
 
         self.empty_state = self._build_empty_state()
-        layout.addWidget(self.empty_state)
+        self.stack.addWidget(self.empty_state)
+        self.stack.setCurrentIndex(1)  # 初始为空状态页
+        layout.addWidget(self.stack, 1)
         return container
 
     def _build_empty_state(self) -> QWidget:
@@ -174,7 +188,9 @@ class MainWindow(FramelessWindow):
         widget.setObjectName("EmptyState")
         layout = QVBoxLayout(widget)
         layout.setSpacing(10)
-        layout.setContentsMargins(0, 40, 0, 40)
+        layout.setContentsMargins(0, 0, 0, 0)
+        # 上下留白撑开，使提示信息垂直居中于主区域
+        layout.addStretch(1)
         icon_label = QLabel()
         icon_label.setPixmap(get_icon("download", "#2C3854", 72).pixmap(72, 72))
         icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -187,6 +203,7 @@ class MainWindow(FramelessWindow):
         layout.addWidget(icon_label)
         layout.addWidget(title)
         layout.addWidget(subtitle)
+        layout.addStretch(1)
         return widget
 
     def _build_footer(self) -> QHBoxLayout:
@@ -211,9 +228,11 @@ class MainWindow(FramelessWindow):
         if kind.value == "magnet":
             worker = MagnetProbe(url, timeout=90, parent=self)
             hint = "正在通过 DHT 网络获取磁力链接的种子信息…"
+            logger.info("提交磁力链接解析：%s", url[:80])
         else:
             worker = UrlProbe(url, parent=self)
             hint = "正在获取文件信息…"
+            logger.info("提交链接解析：%s", url[:80])
         worker.result.connect(self._on_probe_result)
         worker.error.connect(self._on_probe_error)
         worker.finished.connect(self._on_probe_finished)
@@ -250,6 +269,7 @@ class MainWindow(FramelessWindow):
         self._show_hint(f"已添加任务：{task.info.name}", ok=True)
 
     def _on_probe_error(self, message: str):
+        logger.warning("链接解析失败：%s", message)
         self._show_hint(message, error=True)
 
     def _set_busy(self, busy: bool, message: str = ""):
@@ -297,8 +317,7 @@ class MainWindow(FramelessWindow):
 
     def _update_empty_state(self):
         empty = len(self.manager.tasks) == 0
-        self.empty_state.setVisible(empty)
-        self.scroll.setVisible(not empty)
+        self.stack.setCurrentIndex(1 if empty else 0)
 
     def _pause_task(self, task):
         task.pause()
@@ -379,7 +398,15 @@ class MainWindow(FramelessWindow):
 
 
 def run() -> int:
-    import sys
+    # 日志初始化：程序根目录 ./logs 下生成带时间戳与随机后缀的日志文件
+    setup_logging()
+    logger.info("========== Hana Download Helper 启动 ==========")
+
+    def _excepthook(exc_type, exc, tb):
+        logger.error("未捕获异常", exc_info=(exc_type, exc, tb))
+        sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = _excepthook
 
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("Hana Download Helper")
@@ -400,4 +427,9 @@ def run() -> int:
 
     window = MainWindow()
     window.show()
-    return app.exec()
+    logger.info("主窗口已显示，进入事件循环")
+    try:
+        return app.exec()
+    except Exception:
+        logger.exception("主事件循环异常退出")
+        return 1
