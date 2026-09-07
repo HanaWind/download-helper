@@ -105,19 +105,39 @@ class TorrentDownloadTask(BaseTask):
         self._timer.timeout.connect(self._poll)
         self._finish_emitted = False
         self._start_ts = time.time()
-        self.metadata_timeout = 180  # 磁力链接获取种子信息的最长等待（秒）
+        self.metadata_timeout = 30  # 磁力元数据最长等待（秒）
+        self._root_name = ""
+        self._file_count = int(info.extra.get("file_count", 1) or 1) if info else 1
+        self._manifest = []
+
+    def _clear_handle(self, delete_files: bool = False):
+        handle, self._handle = self._handle, None
+        if handle is not None:
+            _remove_handle(handle, delete_files=delete_files)
 
     # ------------------------------------------------------------------ 启动
     def start(self):
-        import libtorrent as lt
+        try:
+            import libtorrent as lt
+        except ImportError as exc:
+            self.fail(f"BT 依赖不可用：请安装兼容 Python 版本的 libtorrent（{exc}）")
+            return
 
         if self.state is TaskState.FINISHED:
             return
-        if self._handle is not None and self.state is TaskState.DOWNLOADING:
+        if self._handle is not None and self.state in (TaskState.ERROR, TaskState.QUEUED):
+            self._clear_handle()
+        if self._handle is not None and self.state in (TaskState.DOWNLOADING, TaskState.PREPARING):
             self._timer.start()
             return
 
-        os.makedirs(self.save_dir, exist_ok=True)
+        try:
+            os.makedirs(self.save_dir, exist_ok=True)
+        except OSError as exc:
+            self.fail(f"创建 BT 保存目录失败：{exc}")
+            return
+        self._start_ts = time.time()
+        self._finish_emitted = False
         session = get_session()
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -135,8 +155,25 @@ class TorrentDownloadTask(BaseTask):
                 & ~lt.torrent_flags.upload_mode
             )
             self._handle = session.add_torrent(params)
-
-        self._finish_emitted = False
+            try:
+                ti = self._handle.torrent_file()
+                self._root_name = ti.name() if ti is not None else (self.info.name or "")
+                self._file_count = int(ti.num_files()) if ti is not None else self._file_count
+                self._manifest = []
+                if ti is not None:
+                    for index in range(self._file_count):
+                        file_entry = ti.files().file_path(index)
+                        file_size = int(ti.files().file_size(index))
+                        normalized = os.path.normpath(file_entry).replace("/", os.sep)
+                        if normalized.startswith(".." + os.sep) or os.path.isabs(normalized):
+                            raise ValueError(f"BT 文件路径非法：{file_entry}")
+                        root_prefix = (self._root_name + os.sep) if self._root_name else ""
+                        relative = normalized[len(root_prefix):] if root_prefix and normalized.startswith(root_prefix) else normalized
+                        if not relative or relative == "." or relative.startswith(".." + os.sep):
+                            raise ValueError(f"BT 文件路径非法：{file_entry}")
+                        self._manifest.append((relative, file_size))
+            except Exception:
+                self._root_name = self.info.name or ""
         self.error = ""
         self.set_state(
             TaskState.PREPARING if self.total <= 0 else TaskState.DOWNLOADING,
@@ -197,8 +234,9 @@ class TorrentDownloadTask(BaseTask):
             # 磁力链接长时间拿不到种子信息：超时后报错，避免界面一直卡在“获取种子信息”
             if self.total < 0 and time.time() - self._start_ts > self.metadata_timeout:
                 logger.warning("磁力链接获取种子信息超时：%s", self.info.url[:60])
-                self.fail("获取种子信息超时，请确认磁力链接有效或网络可访问 DHT")
                 self._timer.stop()
+                self._clear_handle()
+                self.fail("获取 BT 元数据超时（30 秒）：未发现可用节点或节点未返回 metadata")
                 return
             self.set_state(TaskState.PREPARING, "正在获取种子信息…")
             self.emit_updated()
@@ -218,6 +256,26 @@ class TorrentDownloadTask(BaseTask):
             self._finish_emitted = True
             self._on_finished(status)
 
+    def _validate_local_content(self) -> tuple[bool, str]:
+        root = self._root_name or self.info.name
+        root_path = os.path.join(self.save_dir, root)
+        if not os.path.exists(root_path):
+            return False, "本地保存目录中未找到预期文件或目录"
+        if not self._manifest:
+            return True, ""
+        base = root_path if self._file_count > 1 and os.path.isdir(root_path) else self.save_dir
+        for relative, expected_size in self._manifest:
+            path = os.path.join(base, relative) if self._file_count > 1 else os.path.join(self.save_dir, relative)
+            if not os.path.isfile(path):
+                return False, f"BT 文件缺失：{relative}"
+            try:
+                actual_size = os.path.getsize(path)
+            except OSError as exc:
+                return False, f"读取 BT 文件失败：{relative} ({exc})"
+            if actual_size != expected_size:
+                return False, f"BT 文件大小不一致：{relative}（期望 {expected_size}，实际 {actual_size}）"
+        return True, ""
+
     def _on_finished(self, status=None):
         self._timer.stop()
         try:
@@ -228,12 +286,21 @@ class TorrentDownloadTask(BaseTask):
             name = self.info.name or (self._handle.name() if self._handle else "")
         except Exception:
             name = self.info.name
-        candidate = os.path.join(self.save_dir, name)
-        self.save_path = candidate if os.path.exists(candidate) else self.save_dir
+        root = self._root_name or name or self.info.name
+        candidate = os.path.join(self.save_dir, root)
+        valid, reason = self._validate_local_content()
+        if not valid:
+            self.fail(f"BT 下载报告完成，但本地内容校验失败：{reason}")
+            return
+        if self._file_count > 1:
+            self.save_path = candidate if os.path.isdir(candidate) else self.save_dir
+        else:
+            self.save_path = candidate if os.path.isfile(candidate) else self.save_dir
         if self.total > 0:
             self.received = self.total
         self.set_state(TaskState.FINISHED, "下载完成")
         logger.info("BT/磁力任务完成：%s", self.info.name)
+        self._clear_handle()
         self.emit_updated(force=True)
         self.finished.emit(self)
 
@@ -267,9 +334,13 @@ class TorrentDownloadTask(BaseTask):
 
     def cancel(self, remove_files: bool = True):
         self._timer.stop()
-        _remove_handle(self._handle, delete_files=remove_files)
-        self._handle = None
+        self._clear_handle(delete_files=remove_files)
         self.set_state(TaskState.CANCELED, "已取消")
+
+    def fail(self, message: str) -> None:
+        self._timer.stop()
+        self._clear_handle()
+        super().fail(message)
 
     # ------------------------------------------------------------------ 序列化
     def to_dict(self) -> dict:

@@ -132,7 +132,7 @@ def build_qss(palette: dict, translucent: bool = False) -> str:
     return f"""
 * {{
     color: {c('text')};
-    font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", "PingFang SC", sans-serif;
+    font-family: "Segoe UI Variable", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "PingFang SC", sans-serif;
     font-size: 13px;
 }}
 
@@ -170,6 +170,29 @@ QLabel#HeroTitle {{
 QLabel#HeroSubtitle {{
     color: {c('muted')};
     font-size: 12.5px;
+}}
+QLabel#SectionTitle {{
+    color: {c('text')};
+    font-size: 16px;
+    font-weight: 600;
+}}
+QPushButton#SettingsNav {{
+    text-align: left;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    padding: 10px 12px;
+    color: {c('muted')};
+}}
+QPushButton#SettingsNav:hover {{
+    background: {c('ghost_hover')};
+    color: {c('text')};
+}}
+QPushButton#SettingsNav:checked {{
+    background: {c('ghost_bg')};
+    border: 1px solid {c('border')};
+    color: {c('accent')};
+    font-weight: 600;
 }}
 
 QLabel#Muted {{ color: {c('muted')}; }}

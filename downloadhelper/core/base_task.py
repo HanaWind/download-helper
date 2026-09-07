@@ -149,6 +149,8 @@ class BaseTask(QObject):
 
     def retry(self):
         self.error = ""
+        self.state = TaskState.QUEUED
+        self.emit_updated(force=True)
         self.resume()
 
     # ------------------------------------------------------------------ 持久化

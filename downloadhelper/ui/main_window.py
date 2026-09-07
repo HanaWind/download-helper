@@ -9,6 +9,7 @@ from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
+    QMessageBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -226,8 +227,8 @@ class MainWindow(FramelessWindow):
             return
         kind = detect_kind(url)
         if kind.value == "magnet":
-            worker = MagnetProbe(url, timeout=90, parent=self)
-            hint = "正在通过 DHT 网络获取磁力链接的种子信息…"
+            worker = MagnetProbe(url, timeout=30, parent=self)
+            hint = "正在通过 Tracker / DHT / PEX 获取磁力元数据（最长 30 秒）…"
             logger.info("提交磁力链接解析：%s", url[:80])
         else:
             worker = UrlProbe(url, parent=self)
@@ -265,12 +266,24 @@ class MainWindow(FramelessWindow):
         self.config.save_dir = save_dir
         self.config.save()
         self.url_edit.clear()
-        task = self.manager.add_task(info, save_dir)
+        try:
+            task = self.manager.add_task(info, save_dir)
+        except OSError as exc:
+            self._show_hint(str(exc), error=True)
+            QMessageBox.critical(self, "无法添加任务", str(exc))
+            return
         self._show_hint(f"已添加任务：{task.info.name}", ok=True)
 
     def _on_probe_error(self, message: str):
         logger.warning("链接解析失败：%s", message)
         self._show_hint(message, error=True)
+        box = QMessageBox(self)
+        box.setWindowTitle("获取文件信息失败")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(message)
+        box.setInformativeText("请检查链接是否有效、Tracker/DHT 网络是否可访问，然后重试。")
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.exec()
 
     def _set_busy(self, busy: bool, message: str = ""):
         self.confirm_button.setEnabled(not busy)
@@ -366,6 +379,7 @@ class MainWindow(FramelessWindow):
 
     # ------------------------------------------------------------------ 定时刷新
     def _tick(self):
+        get_theme().refresh_if_needed()
         self.manager.tick()
         for task in self.manager.tasks:
             card = self._cards.get(task.id)
@@ -389,11 +403,13 @@ class MainWindow(FramelessWindow):
     # ------------------------------------------------------------------ 退出
     def closeEvent(self, event):
         try:
+            if self._probe is not None:
+                self._cancel_probe()
             self.manager.pause_all()
             self.manager.save_state()
             self.config.save()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("关闭时保存状态失败：%s", exc)
         super().closeEvent(event)
 
 

@@ -44,11 +44,15 @@ class DownloadManager(QObject):
     # ------------------------------------------------------------------ 增删
     def add_task(self, info: FileInfo, save_dir: str = None) -> BaseTask:
         save_dir = save_dir or self.config.save_dir
-        os.makedirs(save_dir, exist_ok=True)
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+        except OSError as exc:
+            raise OSError(f"无法创建保存目录：{save_dir} ({exc})") from exc
         info.name = sanitize_filename(info.name or "", default="download")
         task = create_task(info, save_dir, self.config)
         task.updated.connect(lambda t=task: self._on_task_updated(t))
         task.finished.connect(lambda t=task: self._on_task_finished(t))
+        task.failed.connect(lambda t, _message: self._on_task_failed(t))
         self.tasks.append(task)
         self._index[task.id] = task
         logger.info("添加任务：%s（类型=%s，保存至 %s）", info.name, info.kind.value, save_dir)
@@ -103,11 +107,10 @@ class DownloadManager(QObject):
 
     def resume_all(self):
         for task in self.tasks:
-            if task.state in (TaskState.PAUSED, TaskState.ERROR, TaskState.QUEUED):
-                try:
-                    task.resume()
-                except Exception:
-                    pass
+            if task.state in (TaskState.PAUSED, TaskState.ERROR):
+                task.state = TaskState.QUEUED
+                task.error = ""
+                task.emit_updated(force=True)
         self.pump()
 
     # ------------------------------------------------------------------ 定时刷新
@@ -140,6 +143,11 @@ class DownloadManager(QObject):
     def _on_task_finished(self, task: BaseTask):
         logger.info("任务结束：%s 状态=%s", task.info.name, task.state.name)
         self.taskFinished.emit(task)
+        self._schedule_save()
+        self.pump()
+
+    def _on_task_failed(self, task: BaseTask):
+        logger.error("任务失败：%s 原因=%s", task.info.name, task.error)
         self._schedule_save()
         self.pump()
 
@@ -182,6 +190,7 @@ class DownloadManager(QObject):
                 continue
             task.updated.connect(lambda t=task: self._on_task_updated(t))
             task.finished.connect(lambda t=task: self._on_task_finished(t))
+            task.failed.connect(lambda t, _message: self._on_task_failed(t))
             task.state = TaskState.QUEUED
             if not task.save_dir:
                 continue

@@ -36,20 +36,24 @@ WINDOW_RADIUS = 14
 
 
 def _blur_pixmap(pixmap: QPixmap, radius: int) -> QPixmap:
-    """对 QPixmap 做高斯模糊（利用 QGraphicsBlurEffect 离屏渲染）。"""
+    """对 QPixmap 做带边缘扩展的高斯模糊，避免裁剪边缘透明。"""
     if radius <= 0 or pixmap.isNull():
         return pixmap
+    pad = max(2, int(radius * 1.5))
     scene = QGraphicsScene()
+    scene.setSceneRect(0, 0, pixmap.width() + pad * 2, pixmap.height() + pad * 2)
     item = QGraphicsPixmapItem(pixmap)
+    item.setPos(pad, pad)
     effect = QGraphicsBlurEffect()
-    effect.setBlurRadius(radius)
+    effect.setBlurRadius(float(radius))
     item.setGraphicsEffect(effect)
     scene.addItem(item)
-    result = QPixmap(pixmap.width(), pixmap.height())
+    result = QPixmap(pixmap.width() + pad * 2, pixmap.height() + pad * 2)
     result.fill(Qt.GlobalColor.transparent)
     painter = QPainter(result)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    scene.render(painter)
+    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+    scene.render(painter, target=QRect(0, 0, result.width(), result.height()),
+                 source=scene.sceneRect())
     painter.end()
     return result
 
@@ -169,22 +173,38 @@ class Backdrop(QWidget):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._pixmap = QPixmap()
+        self._source_pixmap = QPixmap()
         self._image = ""
         self._alpha = 0.55
         self._blur = 0
+        self._pixmap_key = None
 
     def refresh_theme(self):
         theme = get_theme()
-        self._image = theme.background_image
-        self._alpha = theme.background_alpha
-        self._blur = theme.background_blur
-        if theme.has_background:
-            pix = QPixmap(self._image)
-            if self._blur > 0:
-                pix = _blur_pixmap(pix, self._blur)
-            self._pixmap = pix
-        else:
-            self._pixmap = QPixmap()
+        image = theme.background_image if theme.has_background else ""
+        alpha = theme.background_alpha
+        blur = theme.background_blur
+        key = (image, blur, self.size().width(), self.size().height())
+        self._image = image
+        self._alpha = alpha
+        self._blur = blur
+        if key != self._pixmap_key:
+            self._pixmap_key = key
+            if image:
+                source = QPixmap(image)
+                if source.isNull():
+                    self._source_pixmap = QPixmap()
+                    self._pixmap = QPixmap()
+                else:
+                    self._source_pixmap = source
+                    self._pixmap = _blur_pixmap(source, blur) if blur > 0 else source
+            else:
+                self._source_pixmap = QPixmap()
+                self._pixmap = QPixmap()
+        self.update()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
         self.update()
 
     def paintEvent(self, event):

@@ -29,6 +29,10 @@ class _PauseRequested(Exception):
     """内部信号：用户暂停，需要重新等待。"""
 
 
+class _ResponseError(RuntimeError):
+    """远端响应与请求分片不一致。"""
+
+
 @dataclass
 class Chunk:
     index: int
@@ -85,6 +89,7 @@ class HttpDownloadTask(BaseTask):
         self._last_state_save = 0.0
         self._failed = False
         self._completed = False
+        self._finalize_lock = threading.Lock()
 
     # ------------------------------------------------------------------ 路径
     @property
@@ -113,25 +118,41 @@ class HttpDownloadTask(BaseTask):
         return chunks
 
     def _load_state(self) -> bool:
-        """读取断点信息，成功恢复返回 True。"""
+        """读取并严格校验断点信息，损坏时从头规划分片。"""
         if not os.path.exists(self._state_path):
             return False
         try:
             with open(self._state_path, "r", encoding="utf-8") as fp:
                 data = json.load(fp)
-        except (OSError, ValueError):
+            saved_total = int(data.get("total", -1))
+            saved_threads = int(data.get("threads", 0))
+            raw_chunks = data.get("chunks", [])
+            chunks = [Chunk.from_dict(item) for item in raw_chunks]
+        except (OSError, ValueError, TypeError, AttributeError):
             return False
-        if int(data.get("total", -1)) != (self.total if self.total > 0 else -1):
-            return False
-        if int(data.get("threads", self.threads)) <= 0:
-            return False
-        try:
-            chunks = [Chunk.from_dict(item) for item in data.get("chunks", [])]
-        except Exception:
-            return False
-        if not chunks:
+        expected_total = self.total if self.total > 0 else -1
+        if saved_total != expected_total or saved_threads <= 0 or saved_threads != len(chunks) or not chunks:
             return False
         if not os.path.exists(self._part_path):
+            return False
+        chunks.sort(key=lambda item: item.index)
+        if len({chunk.index for chunk in chunks}) != len(chunks):
+            return False
+        previous_end = -1
+        for chunk in chunks:
+            if chunk.index < 0 or chunk.start < 0 or chunk.end < -1:
+                return False
+            if chunk.end >= 0:
+                if chunk.end < chunk.start or (expected_total > 0 and chunk.end >= expected_total):
+                    return False
+                if chunk.start <= previous_end:
+                    return False
+                previous_end = chunk.end
+                if chunk.offset < 0 or chunk.offset > chunk.length:
+                    return False
+            elif chunk.offset < 0:
+                return False
+        if expected_total > 0 and (previous_end != expected_total - 1 or chunks[0].start != 0):
             return False
         self.chunks = chunks
         self.received = sum(chunk.offset for chunk in chunks)
@@ -205,6 +226,16 @@ class HttpDownloadTask(BaseTask):
             self._failed = False
         self.start()
 
+    def stop_workers(self, timeout: float = 3.0):
+        self._stop_event.set()
+        self._run_event.set()
+        deadline = time.time() + timeout
+        for thread in list(self._workers.values()):
+            remaining = max(0.0, deadline - time.time())
+            if thread.is_alive():
+                thread.join(timeout=remaining)
+        self._workers = {index: thread for index, thread in self._workers.items() if thread.is_alive()}
+
     def cancel(self, remove_files: bool = True):
         self._stop_event.set()
         self._run_event.set()
@@ -217,8 +248,8 @@ class HttpDownloadTask(BaseTask):
                 try:
                     if path and os.path.exists(path):
                         os.remove(path)
-                except OSError:
-                    pass
+                except OSError as exc:
+                    logger.warning("清理临时文件失败：%s (%s)", path, exc)
         self.set_state(TaskState.CANCELED, "已取消")
 
     # ------------------------------------------------------------------ 工作线程
@@ -288,36 +319,55 @@ class HttpDownloadTask(BaseTask):
 
     def _download_chunk(self, session: requests.Session, chunk: Chunk):
         start_pos = chunk.start + chunk.offset
+        remaining = chunk.remaining()
         headers = dict(self.info.extra.get("headers", {}) or {})
-        if self.info.resumable:
-            if chunk.end >= 0:
-                headers["Range"] = f"bytes={start_pos}-{chunk.end}"
-            elif start_pos > 0:
-                headers["Range"] = f"bytes={start_pos}-"
+        ranged = bool(self.info.resumable and (chunk.end >= 0 or start_pos > 0))
+        if ranged:
+            headers["Range"] = f"bytes={start_pos}-{chunk.end}" if chunk.end >= 0 else f"bytes={start_pos}-"
 
-        response = session.get(
-            self.info.url,
-            headers=headers,
-            stream=True,
-            timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
-            allow_redirects=True,
-        )
         try:
-            if response.status_code == 416:  # 区间越界：可能已下载完
-                chunk.done = True
-                return
+            response = session.get(
+                self.info.url,
+                headers=headers,
+                stream=True,
+                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                allow_redirects=True,
+            )
+        except requests.RequestException as exc:
+            raise _ResponseError(f"网络连接失败：{exc}") from exc
+        try:
+            if response.status_code == 416:
+                raise _ResponseError(f"分片范围无效：{start_pos}-{chunk.end}")
             if response.status_code >= 400:
-                raise RuntimeError(f"HTTP {response.status_code}")
-            if response.status_code == 200:
-                # 服务器忽略了 Range 请求
-                if chunk.index == 0 and chunk.offset == 0:
-                    chunk.start = 0
+                raise _ResponseError(f"服务器返回 HTTP {response.status_code}")
+            if ranged and response.status_code != 206:
+                if response.status_code == 200 and chunk.index == 0 and chunk.offset == 0 and len(self.chunks) == 1:
+                    ranged = False
                 else:
-                    raise RuntimeError("服务器不支持断点续传（未返回 206）")
+                    raise _ResponseError("服务器未返回有效的 206 分片响应")
+
+            if ranged:
+                content_range = response.headers.get("Content-Range", "")
+                expected = f"bytes {start_pos}-{chunk.end}"
+                if not content_range.startswith(expected + "/"):
+                    raise _ResponseError(f"Content-Range 不匹配：期望 {expected}，实际 {content_range or '缺失'}")
+                range_total = content_range.rsplit("/", 1)[-1]
+                if self.total > 0 and range_total != str(self.total):
+                    raise _ResponseError(f"Content-Range 总长度不匹配：期望 {self.total}，实际 {range_total}")
+            content_length = response.headers.get("Content-Length")
+            if content_length and not content_length.isdigit():
+                raise _ResponseError("服务器返回了无效的 Content-Length")
+            declared = int(content_length) if content_length and content_length.isdigit() else None
+            expected_length = remaining if chunk.end >= 0 else declared
+            if expected_length is None and chunk.end < 0 and declared is None:
+                raise _ResponseError("服务器未提供响应长度，无法安全完成未知大小下载")
+            if expected_length is not None and declared is not None and declared != expected_length:
+                raise _ResponseError(f"响应长度不匹配：期望 {expected_length}，实际 {declared}")
 
             mode = "r+b" if os.path.exists(self._part_path) else "wb"
+            written = 0
             with open(self._part_path, mode) as fp:
-                fp.seek(chunk.start + chunk.offset)
+                fp.seek(start_pos)
                 for data in response.iter_content(BLOCK_SIZE):
                     if not data:
                         continue
@@ -325,16 +375,23 @@ class HttpDownloadTask(BaseTask):
                         return
                     if not self._run_event.is_set():
                         raise _PauseRequested()
+                    if expected_length is not None and written + len(data) > expected_length:
+                        raise _ResponseError("服务器响应超过请求分片长度")
                     fp.write(data)
+                    written += len(data)
                     chunk.offset += len(data)
                     self.add_bytes(len(data))
                     self._save_state()
                 fp.flush()
-
+            if expected_length is not None and written != expected_length:
+                raise _ResponseError(f"服务器提前结束响应：期望 {expected_length} 字节，实际 {written} 字节")
             if chunk.end < 0:
-                # 未知长度：服务器关闭连接即视为完成
                 chunk.done = True
                 self.total = max(self.total, self.received)
+            else:
+                chunk.done = chunk.remaining() == 0
+        except OSError as exc:
+            raise _ResponseError(f"写入下载文件失败：{exc}") from exc
         finally:
             response.close()
 
@@ -350,10 +407,15 @@ class HttpDownloadTask(BaseTask):
         self._finalize()
 
     def _finalize(self):
-        if self._completed:
-            return
-        self._completed = True
+        with self._finalize_lock:
+            if self._completed:
+                return
+            self._finalize_locked()
+
+    def _finalize_locked(self):
         try:
+            if not self._part_path or not os.path.exists(self._part_path):
+                raise OSError("临时文件不存在")
             if self.total > 0 and os.path.getsize(self._part_path) != self.total:
                 with open(self._part_path, "r+b") as fp:
                     fp.truncate(self.total)
@@ -364,9 +426,11 @@ class HttpDownloadTask(BaseTask):
                 self.total = self.received
             self.received = self.total if self.total > 0 else self.received
         except OSError as exc:
+            self._completed = False
             self.fail(f"保存文件失败：{exc}")
             return
 
+        self._completed = True
         self._part_path = ""
         try:
             if self._state_path and os.path.exists(self._state_path):

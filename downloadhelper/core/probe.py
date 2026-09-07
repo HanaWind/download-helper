@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import time
 import warnings
+from urllib.parse import parse_qs, unquote, urlparse
 
 from PySide6.QtCore import QThread, Signal
 
@@ -70,6 +71,7 @@ def probe_url(url: str, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)) -> FileInfo:
     if not url.lower().startswith(("http://", "https://")):
         raise ProbeError("仅支持 http / https 链接")
 
+    response = None
     try:
         response = requests.head(
             url, headers=DEFAULT_HEADERS, timeout=timeout, allow_redirects=True
@@ -77,8 +79,11 @@ def probe_url(url: str, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)) -> FileInfo:
         headers = dict(response.headers)
         status = response.status_code
         final_url = response.url
-    except Exception:  # 网络异常 / 服务器不支持 HEAD
+    except requests.RequestException:
         headers, status, final_url = {}, None, url
+    finally:
+        if response is not None:
+            response.close()
 
     if status is None or status >= 400 or not headers.get("Content-Length"):
         try:
@@ -136,10 +141,19 @@ def probe_torrent_url(url: str, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)) -> File
     """下载 .torrent 文件并解析出名称、大小与文件数。"""
     import requests
 
-    response = requests.get(url, headers=DEFAULT_HEADERS, timeout=timeout)
-    if response.status_code >= 400:
-        raise ProbeError(f"种子下载失败：HTTP {response.status_code}")
-    return parse_torrent_bytes(response.content, source=url)
+    response = None
+    try:
+        response = requests.get(url, headers=DEFAULT_HEADERS, timeout=timeout)
+        if response.status_code >= 400:
+            raise ProbeError(f"种子下载失败：HTTP {response.status_code}")
+        if not response.content:
+            raise ProbeError("种子响应为空")
+        return parse_torrent_bytes(response.content, source=url)
+    except requests.RequestException as exc:
+        raise ProbeError(f"种子网络请求失败：{exc}") from exc
+    finally:
+        if response is not None:
+            response.close()
 
 
 def parse_torrent_bytes(data: bytes, source: str = "") -> FileInfo:
@@ -216,15 +230,17 @@ class UrlProbe(QThread):
 
 
 class MagnetProbe(QThread):
-    """解析磁力链接：通过 DHT/PEX 获取元数据（文件名、大小）。"""
+    """解析磁力链接：并行利用 Tracker/DHT/PEX/LSD 获取元数据。"""
+
+    DEFAULT_TIMEOUT = 30
 
     result = Signal(object)
     error = Signal(str)
 
-    def __init__(self, magnet: str, timeout: int = 90, parent=None):
+    def __init__(self, magnet: str, timeout: int = 30, parent=None):
         super().__init__(parent)
         self.magnet = magnet
-        self.timeout = timeout
+        self.timeout = min(max(1, int(timeout)), self.DEFAULT_TIMEOUT)
         self._handle = None
         self._canceled = False
 
@@ -240,9 +256,12 @@ class MagnetProbe(QThread):
                 pass
 
     def run(self):
-        import libtorrent as lt
-
-        from .torrent_task import get_session
+        try:
+            import libtorrent as lt
+            from .torrent_task import get_session
+        except ImportError as exc:
+            self.error.emit(f"BT 依赖不可用：请安装兼容 Python 版本的 libtorrent（{exc}）")
+            return
 
         try:
             with warnings.catch_warnings():
@@ -260,6 +279,17 @@ class MagnetProbe(QThread):
         try:
             session = get_session()
             params.save_path = os.path.join(APP_DIR, "torrents")
+            # 显式 Tracker 能绕过 DHT 冷启动；同时保留 PEX/LSD/DHT 发现。
+            trackers = [unquote(value) for value in parse_qs(urlparse(self.magnet).query).get("tr", [])]
+            if trackers:
+                try:
+                    params.trackers = trackers
+                except Exception:
+                    for tracker in trackers:
+                        try:
+                            params.add_tracker(tracker)
+                        except Exception:
+                            pass
             params.flags = (
                 (params.flags | lt.torrent_flags.upload_mode)
                 & ~lt.torrent_flags.auto_managed
@@ -272,13 +302,16 @@ class MagnetProbe(QThread):
             return
 
         deadline = time.time() + self.timeout
+        last_status = None
         while time.time() < deadline:
             if self._canceled:
+                self._remove_handle()
                 return
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
                     status = self._handle.status()
+                    last_status = status
                     if status.has_metadata:
                         info = self._handle.torrent_file()
                         name = info.name() if info else self._handle.name()
@@ -308,16 +341,33 @@ class MagnetProbe(QThread):
                                 },
                             )
                         )
+                        self._remove_handle()
                         return
             except Exception as exc:
                 logger.error("磁力链接读取种子信息异常：%s 原因=%s", self.magnet[:80], exc)
+                self._remove_handle()
                 self.error.emit(f"读取种子信息失败：{exc}")
                 return
-            self.msleep(400)
+            self.msleep(250)
 
+        peers = getattr(last_status, "num_peers", 0) if last_status is not None else 0
+        connections = getattr(last_status, "num_connections", 0) if last_status is not None else 0
+        self._remove_handle()
+        logger.warning("磁力链接获取种子信息超时：%s peers=%s connections=%s", self.magnet[:80], peers, connections)
+        if peers <= 0 and connections <= 0:
+            reason = "30 秒内未发现可用 Tracker/DHT 节点"
+        elif peers <= 0:
+            reason = "已连接网络但未发现可用 peer"
+        else:
+            reason = "已发现节点但未收到 metadata"
+        self.error.emit(f"获取磁力元数据失败：{reason}。请检查链接、Tracker 或网络设置")
+
+    def _remove_handle(self):
+        handle, self._handle = self._handle, None
+        if handle is None:
+            return
         try:
-            session.remove_torrent(self._handle)
+            from .torrent_task import get_session
+            get_session().remove_torrent(handle)
         except Exception:
             pass
-        logger.warning("磁力链接获取种子信息超时：%s", self.magnet[:80])
-        self.error.emit("获取种子信息超时，请检查网络或磁力链接是否有效")
